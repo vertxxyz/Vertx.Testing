@@ -72,12 +72,11 @@ namespace Vertx.Testing.Editor
 		{
 			StringBuilder stringBuilder = new StringBuilder();
 			
-			int buildSceneCount = SceneManager.sceneCountInBuildSettings;
+			int buildSceneCount = EditorBuildSettings.scenes.Length;
 			for (int buildIndex = 0; buildIndex < buildSceneCount; buildIndex++)
 			{
-				string path = SceneUtility.GetScenePathByBuildIndex(buildIndex);
-				EditorSceneManager.OpenScene(path, buildIndex == 0 ? OpenSceneMode.Single : OpenSceneMode.Additive);
-				Scene scene = SceneManager.GetSceneByBuildIndex(buildIndex);
+				string path = EditorBuildSettings.scenes[buildIndex].path;
+				Scene scene = EditorSceneManager.OpenScene(path, buildIndex == 0 ? OpenSceneMode.Single : OpenSceneMode.Additive);
 
 				string checkingLabel = $"Checking {scene.name} ({buildIndex + 1}/{buildSceneCount}) for missing references.";
 				

@@ -24,21 +24,69 @@ namespace Vertx.Testing.Editor
 		 */
 		public class EventCall
 		{
+			private static Assembly assembly;
+			private static Assembly Assembly => assembly ?? (assembly = typeof(UnityEventBase).Assembly);
+			
+			private static FieldInfo m_PersistentCalls;
+			private static FieldInfo PersistentCalls => m_PersistentCalls ?? (m_PersistentCalls = typeof(UnityEventBase).GetField("m_PersistentCalls", BindingFlags.NonPublic | BindingFlags.Instance));
+			private static MethodInfo getListener;
+			private static MethodInfo GetListener => getListener ?? 
+			                                  (getListener = Assembly.GetType("UnityEngine.Events.PersistentCallGroup").GetMethod("GetListener"));
+			private static FieldInfo m_Mode;
+			private static FieldInfo ModeField => m_Mode ?? (m_Mode = Assembly.GetType("UnityEngine.Events.PersistentCall").GetField("m_Mode", BindingFlags.NonPublic | BindingFlags.Instance));
+
+			private static FieldInfo m_Arguments;
+			private static FieldInfo Arguments => m_Arguments ?? (m_Arguments = Assembly.GetType("UnityEngine.Events.PersistentCall").GetField("m_Arguments", BindingFlags.NonPublic | BindingFlags.Instance));
+			
+			private static FieldInfo m_ObjectArgument;
+			private static FieldInfo ObjectArgument => m_ObjectArgument ?? (m_ObjectArgument = Assembly.GetType("UnityEngine.Events.ArgumentCache").GetField
+			("m_ObjectArgument", BindingFlags.NonPublic | BindingFlags.Instance));
+
+			private Type GetArgumentType(UnityEventBase unityEvent, int index)
+			{
+				MethodInfo methodInfo = GetListener;
+				FieldInfo persistentCalls = PersistentCalls;
+				var listener = methodInfo.Invoke(persistentCalls.GetValue(unityEvent), new object[] {index});
+				var mode = (PersistentListenerMode) ModeField.GetValue(listener);
+				switch (mode)
+				{
+					case PersistentListenerMode.EventDefined:
+					case PersistentListenerMode.Void:
+						return null;
+					case PersistentListenerMode.Object:
+						object value = ObjectArgument.GetValue(Arguments.GetValue(listener));
+						return value?.GetType();
+					case PersistentListenerMode.Int:
+						return typeof(int);
+					case PersistentListenerMode.Float:
+						return typeof(float);
+					case PersistentListenerMode.String:
+						return typeof(string);
+					case PersistentListenerMode.Bool:
+						return typeof(bool);
+					default:
+						throw new ArgumentOutOfRangeException();
+				}
+			}
+
 			public Object Sender;
 			public Object Receiver;
 			public string EventShortName;
 			public string EventFullName;
 			public UnityEventBase UnityEvent;
 			public string Method;
+			private int index;
+			public Type ArgumentType => GetArgumentType(UnityEvent, index);
 
-			public EventCall(Object sender, Object receiver, string eventShortName, string eventFullName, string methodName, UnityEventBase unityEvent)
+			public EventCall(Object sender, Object receiver, string eventShortName, string eventFullName, string methodName, UnityEventBase unityEvent, int i)
 			{
-				Sender = sender is Component sComp ? sComp.gameObject : sender;
-				Receiver = receiver is Component rComp ? rComp.gameObject : receiver;
+				Sender = sender;
+				Receiver = receiver;
 				EventShortName = eventShortName;
 				EventFullName = eventFullName;
 				Method = methodName;
 				UnityEvent = unityEvent;
+				index = i;
 			}
 		}
 
@@ -95,14 +143,17 @@ namespace Vertx.Testing.Editor
 
 		private static void ExtractEvents(HashSet<EventCall> calls, Component caller)
 		{
-			SerializedProperty iterator = new SerializedObject(caller).GetIterator();
-			iterator.Next(true);
-			RecursivelyExtractEvents(calls, caller, iterator, 0);
+			using (var sO = new SerializedObject(caller))
+			{
+				SerializedProperty iterator = sO.GetIterator();
+				iterator.Next(true);
+				RecursivelyExtractEvents(calls, caller, iterator, 0);
+			}
 		}
 
 		private static bool RecursivelyExtractEvents(HashSet<EventCall> calls, Component caller, SerializedProperty iterator, int level)
 		{
-			bool hasData = true;
+			bool hasData;
 
 			do
 			{
@@ -212,7 +263,7 @@ namespace Vertx.Testing.Editor
 				string methodName = unityEvent.GetPersistentMethodName(i);
 				Object receiver = unityEvent.GetPersistentTarget(i);
 
-				calls.Add(new EventCall(caller, receiver, eventShortName, eventFullName, methodName, unityEvent));
+				calls.Add(new EventCall(caller, receiver, eventShortName, eventFullName, methodName, unityEvent, i));
 			}
 		}
 
@@ -293,6 +344,116 @@ namespace Vertx.Testing.Editor
 			}
 
 			return false;
+		}
+
+		#endregion
+
+		#region CheckForIncorrectUnityEventArguments
+
+		[Test]
+		public void CheckForIncorrectUnityEventArgumentsInBuildScenes()
+		{
+			HashSet<Type> componentsThatCanHaveUnityEvent = new HashSet<Type>();
+			RefreshTypesThatCanHoldUnityEvents(componentsThatCanHaveUnityEvent);
+
+			RunFunctionOnSceneRootGameObjects((g, sb) => CheckForIncorrectUnityEventArguments(g.transform, componentsThatCanHaveUnityEvent, sb));
+		}
+		
+		[Test]
+		public void CheckForIncorrectUnityEventArgumentsInPrefabs()
+		{
+			HashSet<Type> componentsThatCanHaveUnityEvent = new HashSet<Type>();
+			RefreshTypesThatCanHoldUnityEvents(componentsThatCanHaveUnityEvent);
+
+			RunFunctionOnAssets((g, sb) => CheckForIncorrectUnityEventArguments(g.transform, componentsThatCanHaveUnityEvent, sb), null);
+		}
+
+		public static void CheckForIncorrectUnityEventArguments(Transform root, HashSet<Type> componentsThatCanHaveUnityEvent, StringBuilder sb)
+		{
+			HashSet<EventCall> calls = new HashSet<EventCall>();
+			foreach (var type in componentsThatCanHaveUnityEvent)
+			{
+				foreach (var o in root.GetComponentsInChildren(type, true))
+				{
+					var caller = o;
+					ExtractDefaultEventTriggers(calls, caller);
+					ExtractEvents(calls, caller);
+				}
+			}
+
+			BindingFlags bindingFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+			foreach (EventCall call in calls)
+			{
+//				Debug.Log($"{call.sender} : {call.receiver} : {call.eventFullName}");
+				if (call.Receiver == null)
+					continue;
+				if (string.IsNullOrEmpty(call.Method))
+					continue;
+				MethodInfo method;
+				Type unityEventType = call.UnityEvent.GetType();
+				try
+				{
+					Type baseType = unityEventType;
+					while (baseType.BaseType != typeof(UnityEventBase))
+						baseType = baseType.BaseType;
+					if (baseType == typeof(UnityEvent))
+					{
+						var argumentType = call.ArgumentType;
+						method = call.Receiver.GetType().GetMethod(call.Method,
+							bindingFlags,
+							null,
+							argumentType == null ? Array.Empty<Type>() : new[] {argumentType}, null);
+					}
+					else
+					{
+						method = call.Receiver.GetType().GetMethod(call.Method, bindingFlags, null, baseType.GetGenericArguments(), null);
+						if (method == null)
+						{
+							var argumentType = call.ArgumentType;
+							method = call.Receiver.GetType().GetMethod(call.Method,
+								bindingFlags, null,
+								argumentType == null ? Array.Empty<Type>() : new[] {argumentType}, null);
+						}
+					}
+				}
+				catch (Exception e)
+				{
+					sb.AppendLine(
+						$"\"{LogObjectWithPath(call.Sender)}\" with receiver \"{call.Receiver}\" fired exception {e.Message} when retrieving method {call.Method}. {call.EventFullName}");
+					continue;
+				}
+
+				if (method == null)
+				{
+					sb.AppendLine($"\"{LogObjectWithPath(call.Sender)}\" has a method " +
+					              $"\"{call.Receiver.GetType().Name}.{call.Method}\" that was not found. {call.EventFullName}, {call.ArgumentType}, {unityEventType}");
+				}
+				else if (method.ReturnParameter.ParameterType != typeof(void))
+				{
+					sb.AppendLine(
+						$"\"{LogObjectWithPath(call.Sender)}\" has a method \"{call.Method}\" " +
+						$"that has a return value \"{method.ReturnParameter.ParameterType}\". {call.EventFullName}");
+				}
+			}
+
+			string LogObjectWithPath(Object @object)
+			{
+				Transform transform;
+				switch (@object)
+				{
+					case Component component:
+						transform = component.transform;
+						break;
+					case GameObject gameObject:
+						transform = gameObject.transform;
+						break;
+					default:
+						return @object.ToString();
+				}
+
+				return AnimationUtility.CalculateTransformPath(transform, null);
+			}
 		}
 
 		#endregion
